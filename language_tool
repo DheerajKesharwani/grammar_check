@@ -1,0 +1,9 @@
+import language_tool_python
+
+tool = language_tool_python.LanguageTool('en-US')
+text = "She dont has no money and its a alright."
+matches = tool.check(text)
+
+for m in matches:
+    print(m.ruleId, "→", m.message)
+    print("   ", m.context)
