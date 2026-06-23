@@ -1,15 +1,3 @@
-"""
-Low Confidence Words Detector — FIXED VERSION
-===============================================
-For Waymo Triage Caption Quality Check (Checklist Item 10)
-
-Fixes from v1:
-  - Added "look like" (not just "looks like")
-  - Added Grammar Fix category (It's, It is, there's)
-  - Added Spatial Precision category (in the front, in front of me)
-  - Added Action Precision category (taking a turn)
-  - Improved auto-fix to handle sentence restructuring
-"""
 
 import re
 from dataclasses import dataclass, field
