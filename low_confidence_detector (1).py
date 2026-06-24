@@ -535,24 +535,7 @@ def interactive_menu():
  
 def run_builtin_tests():
     detector = LowConfidenceDetector()
-    tests = [
-        (
-            "YOUR EXACT SENTENCE",
-            "It's look like that vehicle in the front is taking a right turn"
-        ),
-        (
-            "WAYMO CAPTION WITH ISSUES",
-            "There's a vehicle that looks like it might be slowing down. "
-            "It's probably going to stop somewhere nearby. I think it's "
-            "taking a left turn up ahead."
-        ),
-        (
-            "CLEAN CAPTION — SHOULD PASS",
-            "A white SUV is parked on the right side, partially blocking the lane. "
-            "I will continue straight at 0.8 m/s, navigating carefully. "
-            "In 205 meters I will turn right as per route plan."
-        ),
-    ]
+  
     for (label, text) in tests:
         print(f"\n\n{'#'*65}")
         print(f"  TEST: {label}")
