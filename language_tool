@@ -1,9 +1,1647 @@
-import language_tool_python
+"""
+Waymo Caption Checker v2 — FULL GRAMMAR + LOW CONFIDENCE + SLM
+================================================================
+Three-pass pipeline:
+  Pass 1 — Rule-based Grammar (600+ rules, 25 categories)
+  Pass 2 — Low Confidence Words (20 categories, 150+ patterns)
+  Pass 3 — SLM Coedit (grammarly/coedit-large) contextual rewrite
 
-tool = language_tool_python.LanguageTool('en-US')
-text = "She dont has no money and its a alright."
-matches = tool.check(text)
+Grammar categories covered:
+  01. Articles (a/an)
+  02. Subject-Verb Agreement — 1st person
+  03. Subject-Verb Agreement — 2nd/plural
+  04. Subject-Verb Agreement — 3rd singular
+  05. Modal Verb + Base Form
+  06. Tense Errors (did + past)
+  07. Tense Errors (have/has + past participle)
+  08. Passive Voice Errors
+  09. Gerund vs Infinitive
+  10. Preposition Errors
+  11. Comparative & Superlative
+  12. Double Negatives
+  13. Pronoun Agreement
+  14. Sentence Patterns (there is/are, it is/are)
+  15. Word Order Errors
+  16. Redundant Words
+  17. Pleonasms / Verbose Phrases
+  18. Punctuation & Spacing
+  19. Contractions (missing apostrophe)
+  20. Doubled Words
+  21. Spelling / OCR Fixes
+  22. Number Agreement
+  23. Conditional Sentences
+  24. Relative Clauses
+  25. VLM / AV Domain-Specific
 
-for m in matches:
-    print(m.ruleId, "→", m.message)
-    print("   ", m.context)
+Usage:
+  python waymo_caption_checker_v2.py                   # interactive menu
+  python waymo_caption_checker_v2.py --txt file.txt    # text file
+  python waymo_caption_checker_v2.py --pdf file.pdf    # PDF file
+  python waymo_caption_checker_v2.py --text "caption"  # direct input
+  python waymo_caption_checker_v2.py --save report.txt # save output
+  python waymo_caption_checker_v2.py --no-slm          # skip SLM pass
+
+Install SLM (optional but recommended):
+  pip install transformers torch sentencepiece
+"""
+
+import re, os, sys, argparse
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 1 — LOOKUP DICTIONARIES
+# ════════════════════════════════════════════════════════════════
+
+# ── Sentence abbreviations (never split here) ─────────────────
+_ABBREV = {
+    "approx","no","e.g","i.e","etc","vs","mr","ft","dr","prof",
+    "sr","jr","st","mph","kmh","km","ltd","dept","est","avg",
+    "min","max","sec","hrs","wk","yr","fig","vol","ch","pp",
+    "jan","feb","mar","apr","jun","jul","aug","sep","oct","nov","dec",
+}
+
+# ── Article exceptions ────────────────────────────────────────
+AN_EXCEPTIONS = {
+    "hour","honest","honor","honour","heir","herb","nba","fbi","fda",
+    "mri","nfl","suv","mph","atm","sos","ngo","rbi","svc","adv",
+}
+A_EXCEPTIONS = {
+    "university","unicorn","european","one","user","unit","useful",
+    "unique","united","uniform","universe","universal","usage","usual",
+}
+
+# ── Irregular verbs: base → past / past participle ───────────
+IRREGULAR_VERBS = {
+    "go":     ("went",    "gone"),
+    "come":   ("came",    "come"),
+    "run":    ("ran",     "run"),
+    "see":    ("saw",     "seen"),
+    "eat":    ("ate",     "eaten"),
+    "write":  ("wrote",   "written"),
+    "take":   ("took",    "taken"),
+    "give":   ("gave",    "given"),
+    "make":   ("made",    "made"),
+    "say":    ("said",    "said"),
+    "know":   ("knew",    "known"),
+    "find":   ("found",   "found"),
+    "bring":  ("brought", "brought"),
+    "buy":    ("bought",  "bought"),
+    "get":    ("got",     "gotten"),
+    "drive":  ("drove",   "driven"),
+    "fall":   ("fell",    "fallen"),
+    "break":  ("broke",   "broken"),
+    "speak":  ("spoke",   "spoken"),
+    "choose": ("chose",   "chosen"),
+    "wear":   ("wore",    "worn"),
+    "swim":   ("swam",    "swum"),
+    "begin":  ("began",   "begun"),
+    "drink":  ("drank",   "drunk"),
+    "sing":   ("sang",    "sung"),
+    "throw":  ("threw",   "thrown"),
+    "fly":    ("flew",    "flown"),
+    "draw":   ("drew",    "drawn"),
+    "grow":   ("grew",    "grown"),
+    "show":   ("showed",  "shown"),
+    "steal":  ("stole",   "stolen"),
+    "freeze": ("froze",   "frozen"),
+    "bite":   ("bit",     "bitten"),
+    "hide":   ("hid",     "hidden"),
+    "ride":   ("rode",    "ridden"),
+    "rise":   ("rose",    "risen"),
+    "shake":  ("shook",   "shaken"),
+    "wake":   ("woke",    "woken"),
+    "forget": ("forgot",  "forgotten"),
+    "forgive":("forgave", "forgiven"),
+    "forbid": ("forbade", "forbidden"),
+    "beat":   ("beat",    "beaten"),
+    "bear":   ("bore",    "borne"),
+    "bind":   ("bound",   "bound"),
+    "bleed":  ("bled",    "bled"),
+    "build":  ("built",   "built"),
+    "burn":   ("burned",  "burnt"),
+    "catch":  ("caught",  "caught"),
+    "dig":    ("dug",     "dug"),
+    "feel":   ("felt",    "felt"),
+    "fight":  ("fought",  "fought"),
+    "hang":   ("hung",    "hung"),
+    "hear":   ("heard",   "heard"),
+    "hold":   ("held",    "held"),
+    "hurt":   ("hurt",    "hurt"),
+    "keep":   ("kept",    "kept"),
+    "lay":    ("laid",    "laid"),
+    "lead":   ("led",     "led"),
+    "leave":  ("left",    "left"),
+    "lend":   ("lent",    "lent"),
+    "let":    ("let",     "let"),
+    "lie":    ("lay",     "lain"),
+    "light":  ("lit",     "lit"),
+    "lose":   ("lost",    "lost"),
+    "mean":   ("meant",   "meant"),
+    "meet":   ("met",     "met"),
+    "pay":    ("paid",    "paid"),
+    "put":    ("put",     "put"),
+    "quit":   ("quit",    "quit"),
+    "read":   ("read",    "read"),
+    "sell":   ("sold",    "sold"),
+    "send":   ("sent",    "sent"),
+    "set":    ("set",     "set"),
+    "shoot":  ("shot",    "shot"),
+    "shut":   ("shut",    "shut"),
+    "sit":    ("sat",     "sat"),
+    "sleep":  ("slept",   "slept"),
+    "slide":  ("slid",    "slid"),
+    "spend":  ("spent",   "spent"),
+    "stand":  ("stood",   "stood"),
+    "stick":  ("stuck",   "stuck"),
+    "strike": ("struck",  "struck"),
+    "sweep":  ("swept",   "swept"),
+    "swing":  ("swung",   "swung"),
+    "teach":  ("taught",  "taught"),
+    "tear":   ("tore",    "torn"),
+    "tell":   ("told",    "told"),
+    "think":  ("thought", "thought"),
+    "understand":("understood","understood"),
+    "win":    ("won",     "won"),
+    "wind":   ("wound",   "wound"),
+    "withdraw":("withdrew","withdrawn"),
+}
+
+# ── Contractions ──────────────────────────────────────────────
+CONTRACTIONS = {
+    "dont":"don't","cant":"can't","wont":"won't","didnt":"didn't",
+    "doesnt":"doesn't","isnt":"isn't","arent":"aren't","wasnt":"wasn't",
+    "werent":"weren't","couldnt":"couldn't","shouldnt":"shouldn't",
+    "wouldnt":"wouldn't","hasnt":"hasn't","havent":"haven't",
+    "hadnt":"hadn't","im":"I'm","ive":"I've","youre":"you're",
+    "theyre":"they're","weve":"we've","thats":"that's","hes":"he's",
+    "shes":"she's","its":"it's","whats":"what's","whos":"who's",
+    "wheres":"where's","theres":"there's","heres":"here's",
+    "theyd":"they'd","hed":"he'd","shed":"she'd","youd":"you'd",
+    "wed":"we'd","theyll":"they'll","hell":"he'll","shell":"she'll",
+    "youll":"you'll","well":"we'll","id":"I'd","ill":"I'll",
+}
+
+# ── Pleonasms / Verbose phrases ───────────────────────────────
+PLEONASMS = {
+    r"\batm machine\b":              "ATM",
+    r"\bpin number\b":               "PIN",
+    r"\bfree gift\b":                "gift",
+    r"\bend result\b":               "result",
+    r"\bfinal outcome\b":            "outcome",
+    r"\bpast history\b":             "history",
+    r"\bin order to\b":              "to",
+    r"\bdue to the fact that\b":     "because",
+    r"\bat this point in time\b":    "now",
+    r"\beach and every\b":           "each",
+    r"\bbasic fundamentals\b":       "fundamentals",
+    r"\babsolutely essential\b":     "essential",
+    r"\bcompletely eliminate\b":     "eliminate",
+    r"\bclose proximity\b":          "near",
+    r"\bnew innovation\b":           "innovation",
+    r"\brepeat again\b":             "repeat",
+    r"\bforward planning\b":         "planning",
+    r"\bunexpected surprise\b":      "surprise",
+    r"\btrue fact\b":                "fact",
+    r"\bfuture plans\b":             "plans",
+    r"\bask a question\b":           "ask",
+    r"\bsum total\b":                "total",
+    r"\bjoined together\b":          "joined",
+    r"\bcombine together\b":         "combine",
+    r"\bmerge together\b":           "merge",
+    r"\blink together\b":            "link",
+    r"\bsafe haven\b":               "haven",
+    r"\bshare in common\b":          "share",
+    r"\bcompletely full\b":          "full",
+    r"\bentirely complete\b":        "complete",
+    r"\bmost unique\b":              "unique",
+    r"\bvery unique\b":              "unique",
+    r"\bextremely essential\b":      "essential",
+    r"\bcompletely finished\b":      "finished",
+    r"\bfirst began\b":              "began",
+    r"\bfirst started\b":            "started",
+    r"\bended up\b":                 "ended",
+    r"\benter into\b":               "enter",
+    r"\bexist(s)? today\b":          "exist",
+    r"\bcurrent(ly)? existing\b":    "existing",
+    r"\bpersonal opinion\b":         "opinion",
+    r"\bpositive benefits\b":        "benefits",
+    r"\bunintended mistake\b":       "mistake",
+    r"\bbig in size\b":              "big",
+    r"\bsmall in size\b":            "small",
+    r"\bround in shape\b":           "round",
+    r"\bred in color\b":             "red",
+    r"\bblue in color\b":            "blue",
+    r"\btwo twins\b":                "twins",
+    r"\bhidden secret\b":            "secret",
+    r"\bpast (experience|experiences)\b": "experience",
+    r"\bfuture prospect\b":          "prospect",
+    r"\badvance warning\b":          "warning",
+    r"\bprior experience\b":         "experience",
+    r"\bunnecessary redundancy\b":   "redundancy",
+    r"\bclose in proximity\b":       "near",
+    r"\bfinal conclusion\b":         "conclusion",
+    r"\bendless in duration\b":      "endless",
+    r"\bvery (first|last)\b":        r"\1",
+}
+
+# ── Word-level spelling / OCR fixes ──────────────────────────
+_WORD_FIXES = {
+    r"\bvechile\b":          "vehicle",
+    r"\bvehicel\b":          "vehicle",
+    r"\bvehcile\b":          "vehicle",
+    r"\bped estrian\b":      "pedestrian",
+    r"\bpedestrain\b":       "pedestrian",
+    r"\bped\s+estrian\b":    "pedestrian",
+    r"\bapp ear\b":          "appear",
+    r"\boccured\b":          "occurred",
+    r"\bseperate\b":         "separate",
+    r"\brecieve\b":          "receive",
+    r"\bbelive\b":           "believe",
+    r"\bdefinate\b":         "definite",
+    r"\bdefinately\b":       "definitely",
+    r"\bneccessary\b":       "necessary",
+    r"\baccommodate\b":      "accommodate",
+    r"\bachieve\b":          "achieve",
+    r"\baccomodate\b":       "accommodate",
+    r"\buntill\b":           "until",
+    r"\bfull stop\b":        ".",
+    r"\bwich\b":             "which",
+    r"\bwicht\b":            "which",
+    r"\bthe the\b":          "the",
+    r"\ba a\b":              "a",
+    r"\ban an\b":            "an",
+    r"\bis is\b":            "is",
+    r"\bwas was\b":          "was",
+    r"\bto to\b":            "to",
+    r"\bin in\b":            "in",
+    r"\bof of\b":            "of",
+    r"\band and\b":          "and",
+    r"\bor or\b":            "or",
+    r"\bbecuase\b":          "because",
+    r"\bbecause\b":          "because",
+    r"\bwoud\b":             "would",
+    r"\bshold\b":            "should",
+    r"\bcoud\b":             "could",
+    r"\bwich\b":             "which",
+    r"\bthier\b":            "their",
+    r"\bthier\b":            "there",
+    r"\bwhere\b":            "where",
+    r"\btrafic\b":           "traffic",
+    r"\btraficc\b":          "traffic",
+    r"\blane\s+change\b":    "lane change",
+    r"\binter\s+section\b":  "intersection",
+    r"\bpedes\s+trian\b":    "pedestrian",
+    r"\bcross\s+walk\b":     "crosswalk",
+    r"\bover\s+take\b":      "overtake",
+    r"\bover\s+speed\b":     "overspeed",
+    r"\bmotor\s+cycle\b":    "motorcycle",
+    r"\bmotor\s+way\b":      "motorway",
+    r"\bhigh\s+way\b":       "highway",
+    r"\bround\s+about\b":    "roundabout",
+    r"\bside\s+walk\b":      "sidewalk",
+    r"\bspeed\s+limit\b":    "speed limit",
+    r"\btraffic\s+jam\b":    "traffic jam",
+    r"\bread\s+light\b":     "red light",
+    r"\bgreen\s+light\b":    "green light",
+    r"\bstop\s+sign\b":      "stop sign",
+    r"\byield\s+sign\b":     "yield sign",
+}
+
+# ── Preposition correction map ────────────────────────────────
+PREP_FIXES = {
+    r"\barrived to\b":           "arrived at",
+    r"\bdiscuss about\b":        "discuss",
+    r"\bexplain about\b":        "explain",
+    r"\benter into the\b":       "enter the",
+    r"\btalk about of\b":        "talk about",
+    r"\bwait for to\b":          "wait to",
+    r"\bsearch for\b":           "search",
+    r"\blisten (at|to) music\b": "listen to music",
+    r"\bsleep on the night\b":   "sleep at night",
+    r"\bin Monday\b":            "on Monday",
+    r"\bin the morning on\b":    "in the morning on",
+    r"\bat the weekend\b":       "on the weekend",
+    r"\bdepend of\b":            "depend on",
+    r"\bconsist in\b":           "consist of",
+    r"\binterested on\b":        "interested in",
+    r"\bsatisfied of\b":         "satisfied with",
+    r"\bfamiliar of\b":          "familiar with",
+    r"\baware of about\b":       "aware of",
+    r"\bresponsible of\b":       "responsible for",
+    r"\bsupervise over\b":       "supervise",
+    r"\bemphasize on\b":         "emphasize",
+    r"\bprohibit from to\b":     "prohibit from",
+    r"\baccuse for\b":           "accuse of",
+    r"\bblame of\b":             "blame for",
+    r"\bcongratulate for\b":     "congratulate on",
+    r"\bapologize for to\b":     "apologize to",
+    r"\bdream of about\b":       "dream about",
+    r"\bthink of about\b":       "think about",
+    r"\bwrong of\b":             "wrong about",
+    r"\bsure of about\b":        "sure about",
+    r"\bcompose from\b":         "composed of",
+    r"\bmade by\b":              "made of",
+    r"\bequipped of\b":          "equipped with",
+    r"\bprovide of\b":           "provide with",
+    r"\bcompare to with\b":      "compare with",
+    r"\bin despite of\b":        "despite",
+    r"\bin spite\b":             "in spite of",
+    r"\bregardless to\b":        "regardless of",
+    r"\baccording of\b":         "according to",
+    r"\bdue for\b":              "due to",
+    r"\bowing of\b":             "owing to",
+    r"\binstead to\b":           "instead of",
+    r"\bapart to\b":             "apart from",
+    r"\bassist to\b":            "assist in",
+    r"\bcontribute in\b":        "contribute to",
+}
+
+# ── Pronoun agreement map ─────────────────────────────────────
+PRONOUN_FIXES = {
+    r"\bhim and I\b":            "he and I",
+    r"\bher and I\b":            "she and I",
+    r"\bme and him\b":           "he and I",
+    r"\bme and her\b":           "she and I",
+    r"\bme and them\b":          "they and I",
+    r"\btheirselves\b":          "themselves",
+    r"\bhisself\b":              "himself",
+    r"\bhimself and I\b":        "he and I",
+    r"\byourselves and I\b":     "you and I",
+    r"\boneself\b":              "oneself",
+    r"\byou and me (should|can|will|must|may)\b": r"you and I \1",
+    r"\bme and you (should|can|will|must|may)\b": r"you and I \1",
+    r"\bwho(m)? does\b":         "who does",
+    r"\bwhom is\b":              "who is",
+    r"\bwhom are\b":             "who are",
+    r"\bwhom was\b":             "who was",
+    r"\bwhom were\b":            "who were",
+    r"\bwhom has\b":             "who has",
+    r"\bwhom have\b":            "who have",
+    r"\bwhom can\b":             "who can",
+    r"\bwhom will\b":            "who will",
+    r"\bwhom may\b":             "who may",
+}
+
+# ── Conditional sentence fixes ────────────────────────────────
+CONDITIONAL_FIXES = {
+    r"\bif I was you\b":              "if I were you",
+    r"\bif he was here\b":            "if he were here",
+    r"\bif she was here\b":           "if she were here",
+    r"\bif it was possible\b":        "if it were possible",
+    r"\bif there was no\b":           "if there were no",
+    r"\bif I was able\b":             "if I were able",
+    r"\bif I was in\b":               "if I were in",
+    r"\bwish I was\b":                "wish I were",
+    r"\bwish he was\b":               "wish he were",
+    r"\bwish she was\b":              "wish she were",
+}
+
+# ── Number agreement ──────────────────────────────────────────
+NUMBER_FIXES = {
+    r"\bone vehicles?\b":           "one vehicle",
+    r"\bone persons?\b":            "one person",
+    r"\bone lanes?\b":              "one lane",
+    r"\btwo vehicle\b":             "two vehicles",
+    r"\bthree vehicle\b":           "three vehicles",
+    r"\bfour vehicle\b":            "four vehicles",
+    r"\bfive vehicle\b":            "five vehicles",
+    r"\bmultiple vehicle\b":        "multiple vehicles",
+    r"\bseveral vehicle\b":         "several vehicles",
+    r"\bmany vehicle\b":            "many vehicles",
+    r"\bfew vehicle\b":             "few vehicles",
+    r"\ba vehicles\b":              "a vehicle",
+    r"\ban vehicles\b":             "a vehicle",
+    r"\bthe vehicles is\b":         "the vehicles are",
+    r"\bthe vehicle are\b":         "the vehicle is",
+    r"\bthese vehicle\b":           "these vehicles",
+    r"\bthose vehicle\b":           "those vehicles",
+    r"\beach vehicles\b":           "each vehicle",
+    r"\bevery vehicles\b":          "every vehicle",
+    r"\bno vehicles is\b":          "no vehicles are",
+    r"\bsome vehicle is\b":         "some vehicles are",
+}
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 2 — GRAMMAR PATTERNS (25 categories)
+# ════════════════════════════════════════════════════════════════
+
+def _build_grammar_patterns():
+    P = []
+
+    # ── 01. ARTICLES ─────────────────────────────────────────
+    P += [
+        (r"\ba\s+([aeiouAEIOU]\w*)",
+         r"an \1",
+         "Article: 'a' before vowel → 'an'"),
+        (r"\ban\s+([b-df-hj-np-tv-zB-DF-HJ-NP-TV-Z])(\w*)",
+         r"a \1\2",
+         "Article: 'an' before consonant → 'a'"),
+        (r"\bthe\s+the\b",          "the",   "Article: duplicate 'the'"),
+        (r"\ba\s+a\b",              "a",     "Article: duplicate 'a'"),
+        (r"\ban\s+an\b",            "an",    "Article: duplicate 'an'"),
+        (r"\bthe\s+(SVC-F|ADV|OCR|PDF|GPS|AV|AI|ML|LLM)\b",
+         r"the \1",
+         "Article: keep 'the' before acronym"),
+    ]
+
+    # ── 02. SVA — 1ST PERSON ─────────────────────────────────
+    P += [
+        (r"(?i)\bI\s+does\b",              "I do",        "SVA 1st: I does → I do"),
+        (r"(?i)\bI\s+has\b",               "I have",      "SVA 1st: I has → I have"),
+        (r"(?i)\bI\s+is\b",                "I am",        "SVA 1st: I is → I am"),
+        (r"(?i)\bI\s+are\b",               "I am",        "SVA 1st: I are → I am"),
+        (r"(?i)\bI\s+was\s+not\s+did\b",   "I did not",   "SVA 1st: I was not did → I did not"),
+        (r"(?i)\bI\s+doesn't\b",           "I don't",     "SVA 1st: I doesn't → I don't"),
+        (r"(?i)\bI\s+don't\s+likes\b",     "I don't like","SVA 1st: don't likes → don't like"),
+        (r"(?i)\bI\s+was\s+be\b",          "I was",       "SVA 1st: I was be → I was"),
+        (r"(?i)\bI\s+been\b",              "I have been", "SVA 1st: I been → I have been"),
+        (r"(?i)\bI\s+go\s+to\s+went\b",    "I went to",   "SVA 1st: I go to went → I went to"),
+        (r"(?i)\bam\s+not\s+be\b",         "am not",      "SVA 1st: am not be → am not"),
+        (r"(?i)\bI\s+having\b",            "I have",      "SVA 1st: I having → I have"),
+        (r"(?i)\bI\s+wanting\b",           "I want",      "SVA 1st: I wanting → I want"),
+        (r"(?i)\bI\s+knowing\b",           "I know",      "SVA 1st: I knowing → I know"),
+        (r"(?i)\bI\s+liking\b",            "I like",      "SVA 1st: I liking → I like"),
+        (r"(?i)\bI\s+needing\b",           "I need",      "SVA 1st: I needing → I need"),
+    ]
+
+    # ── 03. SVA — 2ND / PLURAL ───────────────────────────────
+    for subj in ["we","you","they"]:
+        for wrong, right, verb in [
+            ("does","do","does→do"),("has","have","has→have"),
+            ("is","are","is→are"),("was","were","was→were"),
+            ("needs","need","needs→need"),("wants","want","wants→want"),
+            ("goes","go","goes→go"),("runs","run","runs→run"),
+            ("makes","make","makes→make"),("gets","get","gets→get"),
+            ("comes","come","comes→come"),("takes","take","takes→take"),
+            ("says","say","says→say"),("sees","see","sees→see"),
+            ("knows","know","knows→know"),("thinks","think","thinks→think"),
+            ("works","work","works→work"),("looks","look","looks→look"),
+            ("feels","feel","feels→feel"),("lives","live","lives→live"),
+            ("plays","play","plays→play"),("writes","write","writes→write"),
+            ("helps","help","helps→help"),("shows","show","shows→show"),
+            ("turns","turn","turns→turn"),("starts","start","starts→start"),
+            ("stops","stop","stops→stop"),("uses","use","uses→use"),
+            ("allows","allow","allows→allow"),("means","mean","means→mean"),
+            ("includes","include","includes→include"),
+            ("becomes","become","becomes→become"),
+            ("requires","require","requires→require"),
+            ("remains","remain","remains→remain"),
+            ("leads","lead","leads→lead"),("affects","affect","affects→affect"),
+            ("applies","apply","applies→apply"),
+            ("causes","cause","causes→cause"),
+            ("changes","change","changes→change"),
+            ("appears","appear","appears→appear"),
+        ]:
+            P.append((
+                rf"(?i)\b{subj}\s+{wrong}\b",
+                f"{subj} {right}",
+                f"SVA plural: {subj} {verb}"
+            ))
+
+    # ── 04. SVA — 3RD SINGULAR MISSING -s ───────────────────
+    for subj in ["he","she","it"]:
+        for base, inflected in [
+            ("need","needs"),("want","wants"),("have","has"),
+            ("go","goes"),("run","runs"),("make","makes"),
+            ("get","gets"),("come","comes"),("take","takes"),
+            ("think","thinks"),("work","works"),("seem","seems"),
+            ("look","looks"),("feel","feels"),("live","lives"),
+            ("play","plays"),("write","writes"),("speak","speaks"),
+            ("help","helps"),("show","shows"),("turn","turns"),
+            ("start","starts"),("stop","stops"),("use","uses"),
+            ("allow","allows"),("mean","means"),("include","includes"),
+            ("become","becomes"),("contain","contains"),
+            ("provide","provides"),("follow","follows"),
+            ("remain","remains"),("require","requires"),
+            ("represent","represents"),("describe","describes"),
+            ("cause","causes"),("involve","involves"),
+            ("change","changes"),("appear","appears"),
+            ("depend","depends"),("lead","leads"),
+            ("affect","affects"),("apply","applies"),
+            ("move","moves"),("travel","travels"),("approach","approaches"),
+            ("cross","crosses"),("pass","passes"),("enter","enters"),
+            ("exit","exits"),("merge","merges"),("signal","signals"),
+            ("brake","brakes"),("accelerate","accelerates"),
+            ("decelerate","decelerates"),("indicate","indicates"),
+            ("yield","yields"),("proceed","proceeds"),("reverse","reverses"),
+            ("park","parks"),("stop","stops"),("block","blocks"),
+            ("obstruct","obstructs"),("detect","detects"),
+            ("observe","observes"),("warn","warns"),("flash","flashes"),
+            ("honk","honks"),("brake","brakes"),("swerve","swerves"),
+            ("steer","steers"),("navigate","navigates"),
+        ]:
+            P.append((
+                rf"(?i)\b({subj})\s+\b{base}\b",
+                rf"\1 {inflected}",
+                f"SVA 3rd-sg: {subj} {base} → {inflected}"
+            ))
+
+    # ── 05. MODAL VERB + BASE FORM ───────────────────────────
+    modals = r"(?i)\b(can|could|will|would|shall|should|may|might|must|ought to)"
+    verbed = (
+        r"(goes|went|runs|ran|makes|made|gets|got|comes|came|takes|took"
+        r"|says|said|sees|saw|knows|knew|thinks|thought|works|worked"
+        r"|looks|looked|feels|felt|lives|lived|plays|played|writes|wrote"
+        r"|speaks|spoke|helps|helped|shows|showed|turns|turned"
+        r"|starts|started|stops|stopped|uses|used|allows|allowed"
+        r"|moves|moved|travels|traveled|crosses|crossed|passes|passed"
+        r"|enters|entered|brakes|braked|accelerates|accelerated"
+        r"|signals|signaled|parks|parked|merges|merged)"
+    )
+    P.append((
+        rf"{modals}\s+{verbed}\b",
+        lambda m: m.group(1) + " " + re.sub(
+            r"(s|es|ed|ing)$", "", m.group(2).lower()
+        ),
+        "Modal: modal + inflected verb → base form"
+    ))
+
+    # ── 06. TENSE: did + past → base ─────────────────────────
+    for base, (past, _) in IRREGULAR_VERBS.items():
+        P.append((
+            rf"(?i)\bdid\s+{past}\b",
+            f"did {base}",
+            f"Tense: did {past} → did {base}"
+        ))
+    P += [
+        (r"(?i)\bdid\s+was\b",      "was",        "Tense: did was → was"),
+        (r"(?i)\bdid\s+were\b",     "were",       "Tense: did were → were"),
+        (r"(?i)\bdid\s+had\b",      "had",        "Tense: did had → had"),
+        (r"(?i)\bdid\s+been\b",     "had been",   "Tense: did been → had been"),
+        (r"(?i)\bdid\s+done\b",     "did do",     "Tense: did done → did do"),
+        (r"(?i)\bdid\s+seen\b",     "did see",    "Tense: did seen → did see"),
+        (r"(?i)\bdid\s+been\s+able","had been able","Tense: did been able"),
+    ]
+
+    # ── 07. TENSE: have/has + simple past → past participle ──
+    for base, (past, pp) in IRREGULAR_VERBS.items():
+        if past != pp:
+            P.append((
+                rf"(?i)\b(has|have)\s+{past}\b",
+                rf"\1 {pp}",
+                f"Tense: have {past} → have {pp}"
+            ))
+    P += [
+        (r"(?i)\b(has|have)\s+did\b",     r"\1 done",    "Tense: have did → have done"),
+        (r"(?i)\b(has|have)\s+gone to\b", r"\1 gone to", "Tense: keep have gone to"),
+        (r"(?i)\b(had)\s+went\b",          "had gone",    "Tense: had went → had gone"),
+        (r"(?i)\b(had)\s+ran\b",           "had run",     "Tense: had ran → had run"),
+        (r"(?i)\b(had)\s+came\b",          "had come",    "Tense: had came → had come"),
+        (r"(?i)\b(had)\s+saw\b",           "had seen",    "Tense: had saw → had seen"),
+        (r"(?i)\b(had)\s+fell\b",          "had fallen",  "Tense: had fell → had fallen"),
+        (r"(?i)\b(had)\s+broke\b",         "had broken",  "Tense: had broke → had broken"),
+    ]
+
+    # ── 08. PASSIVE VOICE ERRORS ─────────────────────────────
+    P += [
+        (r"(?i)\bwas being (go|run|make|come|take|say|see|know|think|work)\b",
+         lambda m: f"was being {m.group(1)}ing",
+         "Passive: use gerund after 'was being'"),
+        (r"(?i)\bget\s+(wrote|drove|broke|spoke|chose|wore|swam|began|drank|sang|knew)\b",
+         lambda m: "get " + IRREGULAR_VERBS.get(
+             re.sub(r"(wrote|drove|broke|spoke|chose|wore|swam|began|drank|sang|knew)",
+                    lambda x: {"wrote":"write","drove":"drive","broke":"break",
+                               "spoke":"speak","chose":"choose","wore":"wear",
+                               "swam":"swim","began":"begin","drank":"drink",
+                               "sang":"sing","knew":"know"}.get(x.group(),""), m.group(1)
+             ), ("",""))[1],
+         "Passive: get + wrong past tense"),
+        (r"(?i)\bis\s+being\s+(\w+ed)\b",  r"is being \1",  "Passive: is being + past participiple OK"),
+        (r"(?i)\bwas\s+been\b",             "had been",      "Passive: was been → had been"),
+        (r"(?i)\bwere\s+been\b",            "had been",      "Passive: were been → had been"),
+        (r"(?i)\bhas\s+been\s+being\b",     "has been",      "Passive: has been being → has been"),
+        (r"(?i)\bbeing\s+that\b",           "since",         "Passive: being that → since"),
+    ]
+
+    # ── 09. GERUND vs INFINITIVE ─────────────────────────────
+    P += [
+        (r"(?i)\benjoy\s+to\s+(\w+)\b",     lambda m: f"enjoy {m.group(1)}ing",  "Gerund: enjoy to V → enjoy Ving"),
+        (r"(?i)\bavoid\s+to\s+(\w+)\b",      lambda m: f"avoid {m.group(1)}ing",  "Gerund: avoid to V → avoid Ving"),
+        (r"(?i)\bfinish\s+to\s+(\w+)\b",     lambda m: f"finish {m.group(1)}ing", "Gerund: finish to V → finish Ving"),
+        (r"(?i)\bquit\s+to\s+(\w+)\b",       lambda m: f"quit {m.group(1)}ing",   "Gerund: quit to V → quit Ving"),
+        (r"(?i)\bkeep\s+to\s+(\w+)\b",       lambda m: f"keep {m.group(1)}ing",   "Gerund: keep to V → keep Ving"),
+        (r"(?i)\bpractice\s+to\s+(\w+)\b",   lambda m: f"practice {m.group(1)}ing","Gerund: practice to V → Ving"),
+        (r"(?i)\bconsider\s+to\s+(\w+)\b",   lambda m: f"consider {m.group(1)}ing","Gerund: consider to V → Ving"),
+        (r"(?i)\bwant\s+(\w+ing)\b",         lambda m: f"want to {m.group(1)[:-3]}","Infinitive: want Ving → want to V"),
+        (r"(?i)\bneed\s+(\w+ing)\b(?!\s+to)", lambda m: f"need to {m.group(1)[:-3]}","Infinitive: need Ving → need to V"),
+        (r"(?i)\bwould like\s+(\w+ing)\b",   lambda m: f"would like to {m.group(1)[:-3]}","Infinitive: would like Ving → to V"),
+        (r"(?i)\bdecide\s+(\w+ing)\b",       lambda m: f"decide to {m.group(1)[:-3]}","Infinitive: decide Ving → to V"),
+        (r"(?i)\bplan\s+(\w+ing)\b",         lambda m: f"plan to {m.group(1)[:-3]}","Infinitive: plan Ving → to V"),
+        (r"(?i)\bhope\s+(\w+ing)\b",         lambda m: f"hope to {m.group(1)[:-3]}","Infinitive: hope Ving → to V"),
+        (r"(?i)\bmanage\s+(\w+ing)\b",       lambda m: f"manage to {m.group(1)[:-3]}","Infinitive: manage Ving → to V"),
+    ]
+
+    # ── 10. PREPOSITIONS ─────────────────────────────────────
+    for wrong, right in PREP_FIXES.items():
+        P.append((wrong, right, f"Prep: {wrong} → {right}"))
+    P += [
+        (r"(?i)\bparked on the road\b",     "parked on the road shoulder",    "Prep: on the road → shoulder"),
+        (r"(?i)\bwaiting on the light\b",   "waiting for the traffic signal", "Prep: waiting on → waiting for"),
+        (r"(?i)\bturning on the left\b",    "turning to the left",            "Prep: on the left → to the left"),
+        (r"(?i)\bturning on the right\b",   "turning to the right",           "Prep: on the right → to the right"),
+        (r"(?i)\bdriving on the wrong lane\b","driving in the wrong lane",    "Prep: on → in (lane)"),
+        (r"(?i)\bin front from\b",          "in front of",                    "Prep: in front from → of"),
+        (r"(?i)\bahead from\b",             "ahead of",                       "Prep: ahead from → of"),
+        (r"(?i)\bbehind from\b",            "behind",                         "Prep: behind from → behind"),
+        (r"(?i)\bnext of\b",                "next to",                        "Prep: next of → to"),
+        (r"(?i)\badjacent of\b",            "adjacent to",                    "Prep: adjacent of → to"),
+        (r"(?i)\bparallel of\b",            "parallel to",                    "Prep: parallel of → to"),
+        (r"(?i)\bclose of\b",               "close to",                       "Prep: close of → to"),
+        (r"(?i)\bnear of\b",                "near",                           "Prep: near of → near"),
+        (r"(?i)\bapproaching to\b",         "approaching",                    "Prep: approaching to → approaching"),
+        (r"(?i)\bmerging to\b",             "merging into",                   "Prep: merging to → into"),
+        (r"(?i)\benter to\b",               "enter",                          "Prep: enter to → enter"),
+        (r"(?i)\bexit from\b",              "exit",                           "Prep: exit from → exit"),
+        (r"(?i)\byield for\b",              "yield to",                       "Prep: yield for → to"),
+        (r"(?i)\bwait in the light\b",      "wait for the traffic signal",    "Prep: wait in the light"),
+        (r"(?i)\bdriving at the road\b",    "driving on the road",            "Prep: at → on (road)"),
+        (r"(?i)\bparked at the street\b",   "parked on the street",           "Prep: at → on (street)"),
+        (r"(?i)\bmoving at the lane\b",     "moving in the lane",             "Prep: at → in (lane)"),
+        (r"(?i)\bstopped at the middle\b",  "stopped in the middle",          "Prep: at → in (middle)"),
+    ]
+
+    # ── 11. COMPARATIVE & SUPERLATIVE ────────────────────────
+    P += [
+        (r"(?i)\bmore better\b",    "better",     "Comp: more better → better"),
+        (r"(?i)\bmore worse\b",     "worse",      "Comp: more worse → worse"),
+        (r"(?i)\bmore faster\b",    "faster",     "Comp: more faster → faster"),
+        (r"(?i)\bmore slower\b",    "slower",     "Comp: more slower → slower"),
+        (r"(?i)\bmore closer\b",    "closer",     "Comp: more closer → closer"),
+        (r"(?i)\bmore farther\b",   "farther",    "Comp: more farther → farther"),
+        (r"(?i)\bmore harder\b",    "harder",     "Comp: more harder → harder"),
+        (r"(?i)\bmore softer\b",    "softer",     "Comp: more softer → softer"),
+        (r"(?i)\bmost best\b",      "best",       "Super: most best → best"),
+        (r"(?i)\bmost worst\b",     "worst",      "Super: most worst → worst"),
+        (r"(?i)\bmost fastest\b",   "fastest",    "Super: most fastest → fastest"),
+        (r"(?i)\bmost slowest\b",   "slowest",    "Super: most slowest → slowest"),
+        (r"(?i)\bmost nearest\b",   "nearest",    "Super: most nearest → nearest"),
+        (r"(?i)\bmost closest\b",   "closest",    "Super: most closest → closest"),
+        (r"(?i)\bmost unique\b",    "unique",     "Super: most unique → unique"),
+        (r"(?i)\bvery unique\b",    "unique",     "Super: very unique → unique"),
+        (r"(?i)\bvery perfect\b",   "perfect",    "Super: very perfect → perfect"),
+        (r"(?i)\bmore perfect\b",   "more nearly perfect","Comp: more perfect"),
+        (r"(?i)\bmore inferior\b",  "more inferior","Comp: already comparative"),
+        (r"(?i)\bless superior\b",  "less superior","Comp: already comparative"),
+    ]
+
+    # ── 12. DOUBLE NEGATIVES ─────────────────────────────────
+    P += [
+        (r"(?i)\bcan't\s+hardly\b",          "can hardly",          "DblNeg: can't hardly"),
+        (r"(?i)\bdon't\s+have\s+no\b",       "don't have any",      "DblNeg: don't have no"),
+        (r"(?i)\bdoesn't\s+have\s+no\b",     "doesn't have any",    "DblNeg: doesn't have no"),
+        (r"(?i)\bdidn't\s+see\s+nothing\b",  "didn't see anything", "DblNeg: didn't see nothing"),
+        (r"(?i)\bcan't\s+find\s+nowhere\b",  "can't find anywhere", "DblNeg: can't find nowhere"),
+        (r"(?i)\bnot\s+\w+\s+nothing\b",     lambda m: m.group(0).replace("nothing","anything"), "DblNeg: not…nothing"),
+        (r"(?i)\bnever\s+did\s+nothing\b",   "never did anything",  "DblNeg: never did nothing"),
+        (r"(?i)\bnobody\s+didn't\b",         "nobody did",          "DblNeg: nobody didn't"),
+        (r"(?i)\bno\s+one\s+didn't\b",       "no one did",          "DblNeg: no one didn't"),
+        (r"(?i)\bnot\s+no\b",                "not any",             "DblNeg: not no → not any"),
+        (r"(?i)\bnot\s+nobody\b",            "not anybody",         "DblNeg: not nobody"),
+        (r"(?i)\bnot\s+nothing\b",           "not anything",        "DblNeg: not nothing"),
+        (r"(?i)\bnot\s+nowhere\b",           "not anywhere",        "DblNeg: not nowhere"),
+        (r"(?i)\bnot\s+never\b",             "not ever",            "DblNeg: not never"),
+        (r"(?i)\bwithout\s+no\b",            "without any",         "DblNeg: without no"),
+        (r"(?i)\bhardly\s+no\b",             "hardly any",          "DblNeg: hardly no"),
+        (r"(?i)\bscarcely\s+no\b",           "scarcely any",        "DblNeg: scarcely no"),
+        (r"(?i)\bbarely\s+no\b",             "barely any",          "DblNeg: barely no"),
+    ]
+
+    # ── 13. PRONOUN AGREEMENT ────────────────────────────────
+    for wrong, right in PRONOUN_FIXES.items():
+        P.append((wrong, right, f"Pronoun: {wrong} → {right}"))
+    P += [
+        (r"(?i)\btheir\s+is\b",     "there is",     "Pronoun: their is → there is"),
+        (r"(?i)\btheir\s+are\b",    "there are",    "Pronoun: their are → there are"),
+        (r"(?i)\btheir\s+was\b",    "there was",    "Pronoun: their was → there was"),
+        (r"(?i)\btheir\s+were\b",   "there were",   "Pronoun: their were → there were"),
+        (r"(?i)\bthey're\s+car\b",  "their car",    "Pronoun: they're car → their car"),
+        (r"(?i)\bthey're\s+lane\b", "their lane",   "Pronoun: they're lane → their lane"),
+        (r"(?i)\byour\s+welcome\b", "you're welcome","Pronoun: your → you're welcome"),
+        (r"(?i)\bits\s+a\b",        "it's a",        "Pronoun: its a → it's a"),
+        (r"(?i)\bits\s+an\b",       "it's an",       "Pronoun: its an → it's an"),
+        (r"(?i)\bwho's\s+car\b",    "whose car",     "Pronoun: who's → whose"),
+        (r"(?i)\bwho's\s+lane\b",   "whose lane",    "Pronoun: who's → whose"),
+        (r"(?i)\bwho's\s+vehicle\b","whose vehicle", "Pronoun: who's → whose"),
+    ]
+
+    # ── 14. SENTENCE PATTERNS ────────────────────────────────
+    P += [
+        (r"(?i)\bthere\s+is\s+(many|several|numerous|a\s+lot\s+of|lots\s+of)\b",
+         lambda m: "There are " + m.group(1),
+         "SentPat: there is many → there are many"),
+        (r"(?i)\bthere\s+are\s+(a|one)\s+(\w+)\b",
+         lambda m: "There is " + m.group(1) + " " + m.group(2),
+         "SentPat: there are a → there is a"),
+        (r"(?i)\bless\s+(people|students|employees|children|items|things|cases|words|vehicles|pedestrians|cyclists)\b",
+         lambda m: "fewer " + m.group(1),
+         "SentPat: less → fewer (countable)"),
+        (r"(?i)\bit\s+are\b",              "it is",          "SentPat: it are → it is"),
+        (r"(?i)\bit\s+were\s+me\b",        "it was I",       "SentPat: it were me → it was I"),
+        (r"(?i)\bthis\s+are\b",            "these are",      "SentPat: this are → these are"),
+        (r"(?i)\bthat\s+are\b",            "those are",      "SentPat: that are → those are"),
+        (r"(?i)\bthese\s+is\b",            "this is",        "SentPat: these is → this is"),
+        (r"(?i)\bthose\s+is\b",            "that is",        "SentPat: those is → that is"),
+        (r"(?i)\bhere\s+are\s+a\b",        "here is a",      "SentPat: here are a → here is a"),
+        (r"(?i)\bhere\s+is\s+(many|several|multiple)\b",
+         lambda m: "here are " + m.group(1),
+         "SentPat: here is many → here are many"),
+        (r"(?i)\bnot\s+only\s+\.+\s+but\s+also\b",
+         "not only … but also",
+         "SentPat: not only…but also (OK)"),
+        (r"(?i)\beither\s+\.+\s+nor\b",    lambda m: m.group(0).replace("nor","or"), "SentPat: either…nor → either…or"),
+        (r"(?i)\bneither\s+\.+\s+or\b",    lambda m: m.group(0).replace(" or"," nor"), "SentPat: neither…or → neither…nor"),
+        (r"(?i)\bboth\s+\.+\s+as well as\b","both … and",   "SentPat: both…as well as → and"),
+        (r"(?i)\bwhether\s+or\s+not\s+if\b","whether or not","SentPat: whether or not if"),
+        (r"(?i)\bthe reason\s+is\s+because\b","the reason is that","SentPat: reason is because → that"),
+        (r"(?i)\bthe reason\s+why\s+is\s+because\b","the reason is that","SentPat: reason why is because"),
+    ]
+
+    # ── 15. WORD ORDER ERRORS ────────────────────────────────
+    P += [
+        (r"(?i)\bhe\s+go\s+not\b",          "he does not go",    "WordOrder: he go not"),
+        (r"(?i)\bshe\s+go\s+not\b",         "she does not go",   "WordOrder: she go not"),
+        (r"(?i)\balways\s+I\b",              "I always",          "WordOrder: always I → I always"),
+        (r"(?i)\bnever\s+I\b",              "I never",           "WordOrder: never I → I never"),
+        (r"(?i)\boften\s+I\b",              "I often",           "WordOrder: often I → I often"),
+        (r"(?i)\bsometimes\s+I\b",          "I sometimes",       "WordOrder: sometimes I → I sometimes"),
+        (r"(?i)\busually\s+I\b",            "I usually",         "WordOrder: usually I → I usually"),
+        (r"(?i)\bdo\s+I\s+not\b",           "I do not",          "WordOrder: do I not → I do not"),
+        (r"(?i)\bhave\s+I\s+not\b",         "I have not",        "WordOrder: have I not → I have not"),
+        (r"(?i)\bwas\s+I\s+not\b",          "I was not",         "WordOrder: was I not → I was not"),
+        (r"(?i)\bI\s+too\s+go\b",           "I also go",         "WordOrder: I too go → I also go"),
+        (r"(?i)\bI\s+too\s+am\b",           "I am also",         "WordOrder: I too am → I am also"),
+    ]
+
+    # ── 16. REDUNDANT WORDS ──────────────────────────────────
+    P += [
+        (r"(?i)\bmost\s+of\s+all\b",         "most of all",     "Redundant: OK as phrase"),
+        (r"(?i)\bvery\s+much\s+so\b",        "very much so",    "Redundant: OK as phrase"),
+        (r"(?i)\bcompletely\s+and\s+utterly\b","completely",    "Redundant: completely and utterly"),
+        (r"(?i)\bwhereby\s+whereby\b",        "whereby",        "Redundant: double whereby"),
+        (r"(?i)\bmore\s+importantly\s+importantly\b","more importantly","Redundant: double importantly"),
+        (r"(?i)\bso\s+therefore\b",           "therefore",      "Redundant: so therefore → therefore"),
+        (r"(?i)\bbut\s+however\b",            "however",        "Redundant: but however → however"),
+        (r"(?i)\band\s+also\s+too\b",         "and also",       "Redundant: and also too"),
+        (r"(?i)\bbecause\s+the\s+reason\s+is","because",        "Redundant: because the reason is"),
+        (r"(?i)\bfirst\s+of\s+all\s+firstly\b","first of all", "Redundant: first of all firstly"),
+        (r"(?i)\bwhere\s+(?:the\s+)?location\s+is\b","where",  "Redundant: where location is"),
+        (r"(?i)\bwhen\s+the\s+time\s+comes\s+when\b","when",   "Redundant: when...when"),
+    ]
+
+    # ── 17. PLEONASMS ────────────────────────────────────────
+    for pattern, replacement in PLEONASMS.items():
+        P.append((pattern, replacement, f"Pleonasm: {pattern}"))
+
+    # ── 18. PUNCTUATION & SPACING ────────────────────────────
+    P += [
+        (r"\s{2,}",                  " ",     "Spacing: extra spaces"),
+        (r"\s+([.,!?;:])",           r"\1",   "Spacing: space before punctuation"),
+        (r"([.,!?;:])([A-Za-z])",    r"\1 \2","Spacing: missing space after punctuation"),
+        (r"\.{4,}",                  "...",   "Punct: too many dots → ellipsis"),
+        (r"!{2,}",                   "!",     "Punct: multiple ! → single"),
+        (r"\?{2,}",                  "?",     "Punct: multiple ? → single"),
+        (r",{2,}",                   ",",     "Punct: multiple commas → single"),
+        (r"([a-z])\s*-\s*([a-z])",  r"\1-\2","Spacing: normalize hyphen"),
+        (r"(\w)\s+'\s+s\b",         r"\1's", "Spacing: word ' s → word's"),
+        (r"(\w)\s+'\s+t\b",         r"\1't", "Spacing: word ' t → word't"),
+        (r"(\w)\s+'\s+re\b",        r"\1're","Spacing: word ' re → word're"),
+        (r"(\w)\s+'\s+ll\b",        r"\1'll","Spacing: word ' ll → word'll"),
+        (r"(\w)\s+'\s+ve\b",        r"\1've","Spacing: word ' ve → word've"),
+        (r"(\w)\s+'\s+d\b",         r"\1'd", "Spacing: word ' d → word'd"),
+        (r"\s*\n\s*\n\s*",          "\n\n",  "Spacing: multiple blank lines"),
+        (r"^\s+",                    "",      "Spacing: leading whitespace"),
+    ]
+
+    # ── 19. CONTRACTIONS ─────────────────────────────────────
+    # (handled separately in check() method)
+
+    # ── 20. DOUBLED WORDS ────────────────────────────────────
+    # (handled separately in check() method)
+
+    # ── 21. SPELLING / OCR FIXES ─────────────────────────────
+    for pattern, replacement in _WORD_FIXES.items():
+        P.append((pattern, replacement, f"Spell/OCR: {pattern}"))
+
+    # ── 22. NUMBER AGREEMENT ─────────────────────────────────
+    for pattern, replacement in NUMBER_FIXES.items():
+        P.append((pattern, replacement, f"NumAgreement: {pattern}"))
+
+    # ── 23. CONDITIONAL SENTENCES ────────────────────────────
+    for pattern, replacement in CONDITIONAL_FIXES.items():
+        P.append((pattern, replacement, f"Conditional: {pattern}"))
+
+    # ── 24. RELATIVE CLAUSES ─────────────────────────────────
+    P += [
+        (r"(?i)\bthe\s+(\w+)\s+which\s+is\s+(\w+ing)\b",
+         lambda m: f"the {m.group(1)} that is {m.group(2)}",
+         "RelClause: which is Ving → that is Ving (defining)"),
+        (r"(?i)\bthe\s+person\s+which\b",      "the person who",   "RelClause: person which → who"),
+        (r"(?i)\bthe\s+driver\s+which\b",      "the driver who",   "RelClause: driver which → who"),
+        (r"(?i)\bthe\s+pedestrian\s+which\b",  "the pedestrian who","RelClause: pedestrian which → who"),
+        (r"(?i)\bthe\s+cyclist\s+which\b",     "the cyclist who",  "RelClause: cyclist which → who"),
+        (r"(?i)\bthe\s+man\s+which\b",         "the man who",      "RelClause: man which → who"),
+        (r"(?i)\bthe\s+woman\s+which\b",       "the woman who",    "RelClause: woman which → who"),
+        (r"(?i)\bthe\s+child\s+which\b",       "the child who",    "RelClause: child which → who"),
+        (r"(?i)\bwhat\s+I\s+mean\s+is\s+that\b","what I mean is",  "RelClause: ...is that → is"),
+        (r"(?i)\bthe\s+car\s+which\s+it\b",    "the car that",     "RelClause: which it → that"),
+        (r"(?i)\bthe\s+vehicle\s+which\s+it\b","the vehicle that", "RelClause: which it → that"),
+        (r"(?i)\bthat\s+which\b",              "what",             "RelClause: that which → what"),
+        (r"(?i)\bthe\s+fact\s+which\b",        "the fact that",    "RelClause: fact which → that"),
+    ]
+
+    # ── 25. VLM / AV DOMAIN-SPECIFIC ─────────────────────────
+    P += [
+        (r"\bthe pedestrian appear\b",       "the pedestrian appears",   "Domain: SVA pedestrian"),
+        (r"\bpedestrian may enters\b",       "pedestrian may enter",     "Domain: modal+enter"),
+        (r"\bcondition are\b",               "condition is",             "Domain: condition SVA"),
+        (r"\blightning condition are\b",     "lightning condition is",   "Domain: lightning SVA"),
+        (r"\bdata is\b",                     "data are",                 "Domain: data plural"),
+        (r"\bthe ADV (go|move|turn|stop)\b", lambda m: f"the ADV {m.group(1)}s", "Domain: ADV 3rd-sg"),
+        (r"\bSVC-F (show|detect|capture)\b", lambda m: f"SVC-F {m.group(1)}s",  "Domain: SVC-F 3rd-sg"),
+        (r"\bthe camera (show|detect|capture)\b", lambda m: f"the camera {m.group(1)}s","Domain: camera SVA"),
+        (r"\bthe sensor (detect|measure|read)\b",  lambda m: f"the sensor {m.group(1)}s","Domain: sensor SVA"),
+        (r"\bthe system (process|analyze|identify)\b",lambda m: f"the system {m.group(1)}s","Domain: system SVA"),
+        (r"\bthe algorithm (detect|identify|classify)\b",lambda m:f"the algorithm {m.group(1)}s","Domain: algo SVA"),
+        (r"\bthe vehicle travel\b",          "the vehicle travels",      "Domain: vehicle SVA"),
+        (r"\bthe vehicle move\b",            "the vehicle moves",        "Domain: vehicle SVA"),
+        (r"\bthe vehicle approach\b",        "the vehicle approaches",   "Domain: vehicle SVA"),
+        (r"\bthe vehicle brake\b",           "the vehicle brakes",       "Domain: vehicle SVA"),
+        (r"\bthe vehicle accelerate\b",      "the vehicle accelerates",  "Domain: vehicle SVA"),
+        (r"\bthe vehicle decelerate\b",      "the vehicle decelerates",  "Domain: vehicle SVA"),
+        (r"\bthe vehicle indicate\b",        "the vehicle indicates",    "Domain: vehicle SVA"),
+        (r"\bthe vehicle merge\b",           "the vehicle merges",       "Domain: vehicle SVA"),
+        (r"\bthe vehicle park\b",            "the vehicle parks",        "Domain: vehicle SVA"),
+        (r"\bthe vehicle stop\b",            "the vehicle stops",        "Domain: vehicle SVA"),
+        (r"\bthe vehicle reverse\b",         "the vehicle reverses",     "Domain: vehicle SVA"),
+        (r"\bthe vehicle signal\b",          "the vehicle signals",      "Domain: vehicle SVA"),
+        (r"\ba speed of (\d+)\s*m/s\b",     lambda m: f"a speed of {m.group(1)} m/s","Domain: speed format OK"),
+        (r"\bat (\d+)\s*m/s\b",             lambda m: f"at {m.group(1)} m/s",        "Domain: speed format OK"),
+    ]
+
+    return P
+
+_GRAMMAR_PATTERNS = _build_grammar_patterns()
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 3 — LOW CONFIDENCE PATTERNS (20 categories)
+# ════════════════════════════════════════════════════════════════
+
+LOW_CONFIDENCE_PATTERNS = [
+    {"category":"Visual Uncertainty","patterns":[
+        (r"\blooks?\s+like\b","State what it is factually","is"),
+        (r"\bappears to be\b","State what it is — not a guess","is"),
+        (r"\bappears\b","Use factual observation","is"),
+        (r"\bseems to be\b","Avoid assumption — state the fact","is"),
+        (r"\bseems\b","Avoid assumption language","is"),
+        (r"\bI think\b","Remove subjective language",""),
+        (r"\bI believe\b","Remove subjective language",""),
+        (r"\bI feel\b","Remove subjective language",""),
+        (r"\bpossibly\b","Use certain language",""),
+        (r"\bprobably\b","Use certain language",""),
+        (r"\bperhaps\b","Use certain language",""),
+        (r"\bmaybe\b","Use certain language",""),
+        (r"\bit seems\b","State observation directly",""),
+        (r"\bit looks\b","State observation directly",""),
+        (r"\bI notice\b","State observation directly",""),
+        (r"\bI can see\b","State the object directly",""),
+        (r"\bI observe\b","State observation directly",""),
+    ]},
+    {"category":"Modal Uncertainty","patterns":[
+        (r"\bmight be\b","Use definitive statement","is"),
+        (r"\bmight\b","Use definitive statement","will"),
+        (r"\bcould be\b","Use definitive statement","is"),
+        (r"\bcould\b","Use definitive statement","will"),
+        (r"\bwould be\b","Use definitive statement","is"),
+        (r"\bshould be\b","Use factual observation","is"),
+        (r"\bmay be\b","Avoid hedging language","is"),
+        (r"\bmay\b","Avoid hedging language","will"),
+        (r"\bought to\b","Use direct statement","will"),
+        (r"\bwould likely\b","Remove hedging","will"),
+    ]},
+    {"category":"Weak Actions","patterns":[
+        (r"\btrying to\b","State the action directly",""),
+        (r"\battempting to\b","State the action directly",""),
+        (r"\bexpected to\b","Use factual description","will"),
+        (r"\blikely to\b","Use factual description","will"),
+        (r"\blikely\b","Remove hedging adverb",""),
+        (r"\bintend(s|ing)? to\b","Use direct action statement","will"),
+        (r"\bplan(s|ning)? to\b","Use direct action statement","will"),
+        (r"\bhoping to\b","Use direct action statement","will"),
+        (r"\baiming to\b","Use direct action statement","will"),
+        (r"\bstarting to\b","State action factually",""),
+        (r"\bbeginning to\b","State action factually",""),
+        (r"\babout to\b","State the action directly","will"),
+        (r"\bgoing to\b","Use 'will'","will"),
+    ]},
+    {"category":"Action Precision","patterns":[
+        (r"\btaking a right turn\b","Use 'turning right'","turning right"),
+        (r"\btaking a left turn\b","Use 'turning left'","turning left"),
+        (r"\btaking a turn\b","Specify direction","turning"),
+        (r"\bmaking a right turn\b","Use 'turning right'","turning right"),
+        (r"\bmaking a left turn\b","Use 'turning left'","turning left"),
+        (r"\bmaking a U-turn\b","Use 'performing a U-turn'","performing a U-turn"),
+        (r"\bgoing straight\b","Use 'continuing straight'","continuing straight"),
+        (r"\bslowing down\b","Use 'decelerating'","decelerating"),
+        (r"\bspeeding up\b","Use 'accelerating'","accelerating"),
+        (r"\bpicking up speed\b","Use 'accelerating'","accelerating"),
+        (r"\blosing speed\b","Use 'decelerating'","decelerating"),
+        (r"\bpulling over\b","Use 'moving to the right side'","moving to the right side"),
+        (r"\bpulling out\b","Use 'merging into traffic'","merging into traffic"),
+        (r"\bcutting in\b","Use 'merging abruptly into the lane'","merging abruptly into the lane"),
+        (r"\bchanging lanes?\b","Specify direction","merging"),
+        (r"\bswitching lanes?\b","Specify direction","merging"),
+        (r"\bswerving\b","Use 'making an abrupt lateral movement'","making an abrupt lateral movement"),
+        (r"\bbacking up\b","Use 'reversing'","reversing"),
+        (r"\bgoing in reverse\b","Use 'reversing'","reversing"),
+    ]},
+    {"category":"Spatial Precision","patterns":[
+        (r"\bin the front\b","Use 'ahead'","ahead"),
+        (r"\bin front of me\b","Use 'ahead'","ahead"),
+        (r"\bup ahead\b","Use 'ahead'","ahead"),
+        (r"\bover there\b","Specify exact direction/distance",""),
+        (r"\bnearby\b","Specify exact distance in meters",""),
+        (r"\bsomewhere\b","Specify exact location",""),
+        (r"\bfar away\b","Use exact distance in meters",""),
+        (r"\bclose by\b","Use exact distance in meters",""),
+        (r"\bjust ahead\b","Specify exact distance","ahead"),
+        (r"\bvery close\b","Use exact distance in meters",""),
+        (r"\ba bit\b","Use precise measurement",""),
+        (r"\ba little\b","Use precise measurement",""),
+        (r"\bin the distance\b","Use exact distance",""),
+        (r"\baround the corner\b","Use 'at the upcoming intersection'","at the upcoming intersection"),
+        (r"\bsome distance\b","Use exact distance in meters",""),
+    ]},
+    {"category":"Vehicle Description","patterns":[
+        (r"\bsome (car|vehicle|truck|van)\b","Specify vehicle type","a"),
+        (r"\bsomething on the road\b","Identify the object","an object"),
+        (r"\bsome kind of\b","Identify specifically",""),
+        (r"\bwhat appears to be\b","State what it is directly",""),
+        (r"\bwhat looks like\b","State what it is directly",""),
+        (r"\bstalled (car|vehicle)\b","Use 'a stationary vehicle'","a stationary vehicle"),
+    ]},
+    {"category":"Speed Description","patterns":[
+        (r"\bvery (fast|quickly|rapidly|slow|slowly)\b","Use exact speed in m/s",""),
+        (r"\bfast(ly)?\b","Use exact speed in m/s",""),
+        (r"\bslowly\b","Use exact speed in m/s",""),
+        (r"\bquickly\b","Use exact speed in m/s",""),
+        (r"\brapidly\b","Use exact speed in m/s",""),
+        (r"\bat (a )?(high|low|moderate|normal) speed\b","State exact speed",""),
+        (r"\bcrawling\b","Use exact speed in m/s","moving slowly"),
+        (r"\bzooming\b","Use exact speed in m/s","moving"),
+        (r"\bfull speed\b","State exact speed value in m/s",""),
+    ]},
+    {"category":"Traffic Signal","patterns":[
+        (r"\bthe light\b","Specify 'traffic signal' and state","the traffic signal"),
+        (r"\bred light\b","Use 'red traffic signal'","red traffic signal"),
+        (r"\bgreen light\b","Use 'green traffic signal'","green traffic signal"),
+        (r"\byellow light\b","Use 'yellow traffic signal'","yellow traffic signal"),
+        (r"\btraffic light\b","Use 'traffic signal'","traffic signal"),
+        (r"\bthe signal\b","Specify signal type and state","the traffic signal"),
+        (r"\bblinking\b","Specify signal type and color","flashing"),
+    ]},
+    {"category":"Pedestrian and Cyclist","patterns":[
+        (r"\bsomeone\b","Specify: pedestrian or cyclist","a pedestrian"),
+        (r"\ba person\b","Specify role: pedestrian or cyclist","a pedestrian"),
+        (r"\bpeople\b","Specify: pedestrians, cyclists","pedestrians"),
+        (r"\ba (guy|man|woman|child|kid)\b","Use 'a pedestrian' in AV context","a pedestrian"),
+        (r"\bthe (guy|man|woman|child|kid)\b","Use 'the pedestrian'","the pedestrian"),
+        (r"\bbiker\b","Use 'cyclist'","cyclist"),
+        (r"\bmotorbike\b","Use 'motorcycle'","motorcycle"),
+        (r"\bjogging\b","Use 'running'","running"),
+    ]},
+    {"category":"Road Condition","patterns":[
+        (r"\bbad road\b","Specify: potholes, uneven surface","damaged road surface"),
+        (r"\brough road\b","Specify: potholes, gravel","uneven road surface"),
+        (r"\bslippery\b","Specify: wet, icy, or oily surface","low-traction surface"),
+        (r"\bwet road\b","Use 'wet road surface'","wet road surface"),
+        (r"\bicy road\b","Use 'ice-covered road surface'","ice-covered road surface"),
+        (r"\bsome debris\b","Specify type: rock, branch, object","road debris"),
+        (r"\ban obstacle\b","Identify the specific obstacle",""),
+        (r"\bsomething in the road\b","Identify the object specifically","an object in the road"),
+    ]},
+    {"category":"Weather and Visibility","patterns":[
+        (r"\bpoor visibility\b","Specify cause: fog, rain, night","reduced visibility"),
+        (r"\bbright (sun|light|glare)\b","Use 'sun glare reducing visibility'","sun glare"),
+        (r"\ba bit foggy\b","Use 'fog reducing visibility'","fog"),
+        (r"\bdark outside\b","Use 'low ambient light conditions'","low ambient light"),
+        (r"\bright time\b","Use 'daytime conditions'","daytime"),
+        (r"\bnight time\b","Use 'nighttime conditions'","nighttime"),
+    ]},
+    {"category":"Intersection","patterns":[
+        (r"\bthe junction\b","Use 'the intersection at [location]'","the intersection"),
+        (r"\bthe corner\b","Use 'the intersection ahead'","the intersection"),
+        (r"\bT-junction\b","Use 'T-shaped intersection'","T-shaped intersection"),
+        (r"\ba four-way\b","Use 'a four-way intersection'","a four-way intersection"),
+        (r"\bthe merge\b","Use 'the merge point ahead'","the merge point ahead"),
+    ]},
+    {"category":"Lane Description","patterns":[
+        (r"\bmy lane\b","Use 'the current lane'","the current lane"),
+        (r"\bthe other lane\b","Specify: left/right/adjacent lane","the adjacent lane"),
+        (r"\bthe wrong lane\b","Use 'the oncoming traffic lane'","the oncoming traffic lane"),
+        (r"\bthe fast lane\b","Use 'the passing lane'","the passing lane"),
+        (r"\bthe slow lane\b","Use 'the rightmost lane'","the rightmost lane"),
+        (r"\bblocking (my|the) lane\b","Use 'obstructing the current lane'","obstructing the current lane"),
+        (r"\bout of (my|the) lane\b","Use 'crossing the lane boundary'","crossing the lane boundary"),
+    ]},
+    {"category":"Parking and Stationary","patterns":[
+        (r"\bstanding still\b","Use 'stationary'","stationary"),
+        (r"\bnot moving\b","Use 'stationary'","stationary"),
+        (r"\bdouble parked\b","Use 'parked in the travel lane'","parked in the travel lane"),
+        (r"\bon the side of the road\b","Use 'on the road shoulder'","on the road shoulder"),
+        (r"\bhalfway in the road\b","Use 'partially blocking the lane'","partially blocking the lane"),
+    ]},
+    {"category":"Emergency Vehicle","patterns":[
+        (r"\bemergency vehicle\b","Specify: ambulance, fire truck, police",""),
+        (r"\bpolice car\b","Confirm marked or unmarked","marked patrol vehicle"),
+        (r"\bfire truck\b","Confirm as fire apparatus","fire apparatus"),
+        (r"\brush(ing)? past\b","Use 'passing at high speed with siren'","passing at high speed"),
+    ]},
+    {"category":"Construction Zone","patterns":[
+        (r"\broad works?\b","Use 'active construction zone'","active construction zone"),
+        (r"\blane closed\b","Use 'lane closure ahead'","lane closure ahead"),
+        (r"\bwork(ers)? (on|in) the road\b","Use 'construction workers in roadway'","construction workers in roadway"),
+    ]},
+    {"category":"Approximation","patterns":[
+        (r"\babout\b","Use exact value if known","approximately"),
+        (r"\broughly\b","Use exact value if known","approximately"),
+        (r"\bkind of\b","Remove filler phrase",""),
+        (r"\bsort of\b","Remove filler phrase",""),
+        (r"\bsomewhat\b","Use precise description",""),
+        (r"\ba few (meters|seconds|cars)\b","Use exact count",""),
+        (r"\ba lot of\b","Use exact count","multiple"),
+    ]},
+    {"category":"Visibility Doubt","patterns":[
+        (r"\bnot\s+sure\b","Remove uncertainty expression",""),
+        (r"\buncertain\b","Remove uncertainty expression",""),
+        (r"\bhard to (tell|say|see)\b","Remove if not confirmable",""),
+        (r"\bI cannot (tell|say|confirm)\b","Remove unverifiable claims",""),
+        (r"\bI('m| am) not sure\b","Remove subjective uncertainty",""),
+        (r"\bnot clearly visible\b","Omit if not clearly visible",""),
+        (r"\bI can'?t (see|tell|confirm)\b","Remove unverifiable claims",""),
+        (r"\bpartially visible\b","Describe only what IS visible",""),
+        (r"\bbarely visible\b","Remove or specify condition",""),
+        (r"\bout of sight\b","Remove — object not in scene",""),
+    ]},
+    {"category":"Grammar Fix","patterns":[
+        (r"\bIt'?s\s+look\b","Remove entirely","The"),
+        (r"\bIt'?s\s+looks\b","Remove 'It's'","It"),
+        (r"\bIt'?s\b","Use subject noun instead","The"),
+        (r"\bThere'?s\b","Be specific","A"),
+        (r"\bthey'?re\b","Use 'they are'","they are"),
+        (r"\bwe'?re\b","Use 'we are'","we are"),
+        (r"\bdon'?t\b","Use 'do not'","do not"),
+        (r"\bcan'?t\b","Use 'cannot'","cannot"),
+        (r"\bwon'?t\b","Use 'will not'","will not"),
+        (r"\bisn'?t\b","Use 'is not'","is not"),
+        (r"\baren'?t\b","Use 'are not'","are not"),
+        (r"\bwasn'?t\b","Use 'was not'","was not"),
+        (r"\bweren'?t\b","Use 'were not'","were not"),
+        (r"\bdidn'?t\b","Use 'did not'","did not"),
+        (r"\bhasn'?t\b","Use 'has not'","has not"),
+        (r"\bhaven'?t\b","Use 'have not'","have not"),
+        (r"\bI'?ll\b","Use 'I will'","I will"),
+        (r"\byou'?re\b","Use 'you are'","you are"),
+        (r"\blet'?s\b","Use 'let us'","let us"),
+    ]},
+    {"category":"Animal on Road","patterns":[
+        (r"\ban animal\b","Specify animal type: dog, deer, bird etc",""),
+        (r"\bsome animal\b","Specify animal type","an animal"),
+        (r"\bwildlife\b","Specify animal type on road","an animal"),
+    ]},
+]
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 4 — DATA CLASSES
+# ════════════════════════════════════════════════════════════════
+
+@dataclass
+class GrammarIssue:
+    original:  str
+    corrected: str
+    label:     str
+    position:  int
+    sentence:  str
+
+@dataclass
+class LCIssue:
+    word_found: str
+    category:   str
+    reason:     str
+    suggestion: str
+    position:   int
+    sentence:   str
+
+@dataclass
+class CombinedResult:
+    original_text:     str
+    source_file:       str = "manual input"
+    grammar_issues:    List[GrammarIssue] = field(default_factory=list)
+    grammar_corrected: str = ""
+    lc_issues:         List[LCIssue]     = field(default_factory=list)
+    lc_corrected:      str = ""
+    lc_categories_hit: List[str]         = field(default_factory=list)
+    slm_corrected:     str = ""
+    slm_available:     bool = False
+    final_text:        str = ""
+    passed:            bool = False
+
+    def summary(self) -> str:
+        g = len(self.grammar_issues)
+        l = len(self.lc_issues)
+        if g == 0 and l == 0:
+            return "✅ FULLY PASSED — No grammar or low confidence issues found"
+        parts = []
+        if g: parts.append(f"{g} grammar issue(s)")
+        if l: parts.append(f"{l} low confidence issue(s)")
+        return "❌ FAILED — " + " + ".join(parts)
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 5 — FILE INPUT HANDLER
+# ════════════════════════════════════════════════════════════════
+
+class FileInputHandler:
+
+    @staticmethod
+    def read_pdf(filepath: str) -> str:
+        try:
+            import pypdf
+        except ImportError:
+            print("❌ pypdf not installed. Run: pip install pypdf"); sys.exit(1)
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"PDF not found: {filepath}")
+        print(f"\n📄 Reading PDF: {filepath}")
+        pages = []
+        with open(filepath, "rb") as f:
+            reader = pypdf.PdfReader(f)
+            print(f"   Pages: {len(reader.pages)}")
+            for i, page in enumerate(reader.pages):
+                t = page.extract_text()
+                if t and t.strip():
+                    pages.append(t.strip())
+                    print(f"   Page {i+1}: {len(t)} chars")
+                else:
+                    print(f"   Page {i+1}: ⚠️  no text (scanned?)")
+        if not pages:
+            raise ValueError("No text extracted.")
+        full = "\n\n".join(pages)
+        print(f"✅ PDF read: {len(full)} chars")
+        return full
+
+    @staticmethod
+    def read_txt(filepath: str) -> str:
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"File not found: {filepath}")
+        print(f"\n📝 Reading: {filepath}")
+        for enc in ["utf-8","utf-8-sig","latin-1","cp1252"]:
+            try:
+                with open(filepath,"r",encoding=enc) as f:
+                    text = f.read()
+                print(f"✅ Read ({enc}) — {len(text)} chars")
+                return text
+            except UnicodeDecodeError:
+                continue
+        raise ValueError(f"Cannot read file: {filepath}")
+
+    @staticmethod
+    def read_manual() -> str:
+        print("\n✏️  Enter text (press ENTER twice when done):\n")
+        lines, empty = [], 0
+        while True:
+            try:
+                line = input()
+                if line == "":
+                    empty += 1
+                    if empty >= 2: break
+                else:
+                    empty = 0; lines.append(line)
+            except EOFError:
+                break
+        text = "\n".join(lines).strip()
+        if not text: raise ValueError("No text entered.")
+        print(f"\n✅ Input received — {len(text)} chars")
+        return text
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 6 — GRAMMAR CHECKER
+# ════════════════════════════════════════════════════════════════
+
+class GrammarChecker:
+
+    def __init__(self):
+        self._patterns = []
+        for entry in _GRAMMAR_PATTERNS:
+            pat, repl, label = entry
+            try:
+                self._patterns.append((re.compile(pat), repl, label))
+            except re.error:
+                pass
+        self._pleonasms = [
+            (re.compile(p, re.IGNORECASE), r, "Pleonasm")
+            for p, r in PLEONASMS.items()
+        ]
+        self._word_fixes = [
+            (re.compile(p, re.IGNORECASE), r, "Spell/OCR")
+            for p, r in _WORD_FIXES.items()
+        ]
+
+    def _sentences(self, text: str) -> List[Tuple[int,str]]:
+        results = []
+        for m in re.finditer(r'[^.!?\n]+[.!?\n]?', text):
+            results.append((m.start(), m.group().strip()))
+        return results
+
+    def _find_sent(self, pos: int, sents: List[Tuple[int,str]]) -> str:
+        for (start, sent) in sents:
+            if start <= pos <= start + len(sent):
+                return sent
+        return ""
+
+    def check(self, text: str) -> Tuple[List[GrammarIssue], str]:
+        issues    = []
+        corrected = text
+        sents     = self._sentences(text)
+
+        # Word fixes first
+        for (regex, repl, label) in self._word_fixes:
+            for m in regex.finditer(corrected):
+                try:
+                    new = regex.sub(repl, m.group())
+                    if new != m.group():
+                        issues.append(GrammarIssue(m.group(), new, label, m.start(),
+                                                   self._find_sent(m.start(), sents)))
+                except Exception: pass
+            try: corrected = regex.sub(repl, corrected)
+            except Exception: pass
+
+        # Contractions
+        for m in re.finditer(r"\b([A-Za-z]+)\b", corrected):
+            low = m.group(1).lower()
+            if low in CONTRACTIONS and not m.group(1)[0].isupper():
+                fix = CONTRACTIONS[low]
+                issues.append(GrammarIssue(m.group(1), fix,
+                    f"Contraction: {m.group(1)} → {fix}", m.start(),
+                    self._find_sent(m.start(), sents)))
+
+        # Doubled words
+        for m in re.finditer(r"\b(\w+)\s+\1\b", corrected, re.IGNORECASE):
+            issues.append(GrammarIssue(m.group(0), m.group(1),
+                f"Doubled word: '{m.group(1)}'", m.start(),
+                self._find_sent(m.start(), sents)))
+
+        # All grammar patterns
+        for (regex, repl, label) in self._patterns:
+            for m in regex.finditer(corrected):
+                try:
+                    new = m.expand(repl) if isinstance(repl,str) else repl(m)
+                    if new.strip() != m.group().strip():
+                        issues.append(GrammarIssue(m.group(), new, label, m.start(),
+                                                   self._find_sent(m.start(), sents)))
+                except Exception: pass
+            try:
+                corrected = regex.sub(repl, corrected)
+            except Exception: pass
+
+        # Deduplicate
+        seen, unique = set(), []
+        for issue in sorted(issues, key=lambda x: x.position):
+            key = (issue.position, issue.original.lower())
+            if key not in seen:
+                seen.add(key); unique.append(issue)
+
+        # Cleanup
+        corrected = re.sub(r' {2,}', ' ', corrected).strip()
+        return unique, corrected
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 7 — LOW CONFIDENCE CHECKER
+# ════════════════════════════════════════════════════════════════
+
+class LowConfidenceChecker:
+
+    def __init__(self):
+        self._compiled = []
+        for cat_block in LOW_CONFIDENCE_PATTERNS:
+            cat = cat_block["category"]
+            for (pattern, reason, suggestion) in cat_block["patterns"]:
+                try:
+                    self._compiled.append({
+                        "regex": re.compile(pattern, re.IGNORECASE),
+                        "category": cat, "reason": reason, "suggestion": suggestion,
+                    })
+                except re.error: pass
+
+    def _sentences(self, text: str) -> List[Tuple[int,str]]:
+        results = []
+        for m in re.finditer(r'[^.!?\n]+[.!?\n]?', text):
+            results.append((m.start(), m.group().strip()))
+        return results
+
+    def check(self, text: str) -> Tuple[List[LCIssue], str, List[str]]:
+        issues    = []
+        sentences = self._sentences(text)
+
+        for entry in self._compiled:
+            for match in entry["regex"].finditer(text):
+                pos = match.start()
+                sentence = text
+                for (start, sent) in sentences:
+                    if start <= pos <= start + len(sent):
+                        sentence = sent; break
+                issues.append(LCIssue(
+                    word_found = match.group(), category = entry["category"],
+                    reason = entry["reason"], suggestion = entry["suggestion"],
+                    position = pos, sentence = sentence,
+                ))
+
+        seen, unique = set(), []
+        for issue in sorted(issues, key=lambda x: x.position):
+            key = (issue.position, issue.word_found.lower())
+            if key not in seen:
+                seen.add(key); unique.append(issue)
+
+        cleaned = text
+        for issue in sorted(unique, key=lambda x: x.position, reverse=True):
+            pat = re.compile(re.escape(issue.word_found), re.IGNORECASE)
+            cleaned = pat.sub(issue.suggestion if issue.suggestion else " ", cleaned, count=1)
+
+        cleaned = re.sub(r'\bis\s+to\s+be\b', 'is', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\bwill\s+to\b',    'will', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r' {2,}',             ' ',   cleaned)
+        cleaned = cleaned.strip()
+
+        cats = list({i.category for i in unique})
+        return unique, cleaned, cats
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 8 — SLM COEDIT CORRECTOR
+# ════════════════════════════════════════════════════════════════
+
+class SLMCorrector:
+    """
+    Uses grammarly/coedit-large for contextual grammar correction.
+    Falls back gracefully if model not installed.
+
+    Install: pip install transformers torch sentencepiece
+    """
+
+    MODEL_NAME = "grammarly/coedit-large"
+
+    def __init__(self):
+        self.available = False
+        self.tokenizer = None
+        self.model     = None
+        self._try_load()
+
+    def _try_load(self):
+        try:
+            from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+            print("⚙️  Loading SLM (grammarly/coedit-large)... ", end="", flush=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
+            self.model     = AutoModelForSeq2SeqLM.from_pretrained(self.MODEL_NAME)
+            self.available = True
+            print("✅ Loaded")
+        except Exception as e:
+            print(f"\n⚠️  SLM not available ({type(e).__name__})")
+            print("   To enable: pip install transformers torch sentencepiece")
+            print("   Skipping SLM pass — rule-based corrections still applied.\n")
+            self.available = False
+
+    def correct(self, text: str) -> str:
+        if not self.available:
+            return text
+
+        # Split into sentences for better SLM performance
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        corrected_parts = []
+
+        for sent in sentences:
+            if not sent.strip():
+                continue
+            try:
+                prompt = f"Fix grammatical errors in this sentence: {sent}"
+                inputs = self.tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    max_length=256,
+                    truncation=True
+                )
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=256,
+                    num_beams=4,
+                    early_stopping=True,
+                    no_repeat_ngram_size=2,
+                )
+                fixed = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                corrected_parts.append(fixed)
+            except Exception:
+                corrected_parts.append(sent)  # fallback: keep original
+
+        return " ".join(corrected_parts)
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 9 — COMBINED CHECKER ENGINE
+# ════════════════════════════════════════════════════════════════
+
+class WaymoCapChecker:
+
+    def __init__(self, use_slm: bool = True):
+        self.grammar = GrammarChecker()
+        self.lc      = LowConfidenceChecker()
+        self.slm     = SLMCorrector() if use_slm else None
+
+    def analyze(self, text: str, source_file: str = "manual input") -> CombinedResult:
+        result = CombinedResult(original_text=text, source_file=source_file)
+
+        # ── Pass 1: Grammar rules ─────────────────────────────
+        g_issues, g_corrected     = self.grammar.check(text)
+        result.grammar_issues     = g_issues
+        result.grammar_corrected  = g_corrected
+
+        # ── Pass 2: Low confidence on grammar-corrected text ──
+        lc_issues, lc_corrected, cats = self.lc.check(g_corrected)
+        result.lc_issues          = lc_issues
+        result.lc_corrected       = lc_corrected
+        result.lc_categories_hit  = cats
+
+        # ── Pass 3: SLM contextual rewrite ───────────────────
+        if self.slm and self.slm.available:
+            result.slm_corrected  = self.slm.correct(lc_corrected)
+            result.slm_available  = True
+            result.final_text     = result.slm_corrected
+        else:
+            result.slm_corrected  = lc_corrected
+            result.slm_available  = False
+            result.final_text     = lc_corrected
+
+        result.passed = (len(g_issues) == 0 and len(lc_issues) == 0)
+        return result
+
+    def report(self, result: CombinedResult) -> str:
+        W = 74
+        lines = []
+        lines.append("=" * W)
+        lines.append("  WAYMO CAPTION CHECKER v2 — FULL REPORT")
+        lines.append("  Pass 1: Grammar Rules (25 categories, 600+ patterns)")
+        lines.append("  Pass 2: Low Confidence Words (20 categories, 150+ patterns)")
+        lines.append("  Pass 3: SLM Coedit (grammarly/coedit-large)")
+        lines.append("=" * W)
+        lines.append(f"\n  Source   : {result.source_file}")
+        lines.append(f"  Status   : {result.summary()}")
+        lines.append(f"  Grammar  : {len(result.grammar_issues)} issue(s) found")
+        lines.append(f"  Low Conf : {len(result.lc_issues)} issue(s) found")
+        lines.append(f"  SLM      : {'✅ Applied' if result.slm_available else '⚠️  Not available (pip install transformers torch)'}")
+        if result.lc_categories_hit:
+            lines.append(f"  LC Cats  : {', '.join(result.lc_categories_hit)}")
+
+        # Grammar section
+        if result.grammar_issues:
+            lines.append("\n" + "─" * W)
+            lines.append("  SECTION A — GRAMMAR ISSUES (Rule-Based)")
+            lines.append("─" * W)
+            for i, issue in enumerate(result.grammar_issues, 1):
+                lines.append(f"\n  #{i}  {issue.label}")
+                lines.append(f"       Found    : '{issue.original}'")
+                lines.append(f"       Fix      : → '{issue.corrected}'")
+                if issue.sentence:
+                    lines.append(f"       Sentence : {issue.sentence[:85]}")
+        else:
+            lines.append("\n  SECTION A — GRAMMAR: ✅ No issues found")
+
+        # Low confidence section
+        if result.lc_issues:
+            lines.append("\n" + "─" * W)
+            lines.append("  SECTION B — LOW CONFIDENCE WORDS")
+            lines.append("─" * W)
+            for i, issue in enumerate(result.lc_issues, 1):
+                fix = f"→ '{issue.suggestion}'" if issue.suggestion else "→ REMOVE"
+                lines.append(f"\n  #{i}  [{issue.category}]")
+                lines.append(f"       Found    : '{issue.word_found}'")
+                lines.append(f"       Reason   : {issue.reason}")
+                lines.append(f"       Fix      : {fix}")
+                lines.append(f"       Sentence : {issue.sentence[:85]}")
+        else:
+            lines.append("\n  SECTION B — LOW CONFIDENCE: ✅ No issues found")
+
+        # Before / After
+        lines.append("\n" + "─" * W)
+        trunc = lambda s, n: s[:n] + ("..." if len(s) > n else "")
+        lines.append("  ORIGINAL:")
+        lines.append(f"  {trunc(result.original_text, 400)}")
+        lines.append("\n  AFTER PASS 1 — Grammar fixed:")
+        lines.append(f"  {trunc(result.grammar_corrected, 400)}")
+        lines.append("\n  AFTER PASS 2 — Low confidence fixed:")
+        lines.append(f"  {trunc(result.lc_corrected, 400)}")
+        if result.slm_available:
+            lines.append("\n  AFTER PASS 3 — SLM contextual rewrite:")
+            lines.append(f"  {trunc(result.slm_corrected, 400)}")
+        lines.append("\n  FINAL TEXT:")
+        lines.append(f"  {trunc(result.final_text, 400)}")
+        lines.append("=" * W)
+        return "\n".join(lines)
+
+    def save_report(self, result: CombinedResult, output_path: str = None):
+        if output_path is None:
+            base = os.path.basename(os.path.splitext(result.source_file)[0])
+            output_path = f"{base}_waymo_report.txt"
+        content = (
+            self.report(result)
+            + "\n\n" + "=" * 74
+            + "\n  FULL FINAL CORRECTED TEXT\n"
+            + "=" * 74
+            + f"\n\n{result.final_text}\n"
+        )
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"\n💾 Report saved: {output_path}")
+        return output_path
+
+
+# ════════════════════════════════════════════════════════════════
+# ░░  SECTION 10 — INTERACTIVE MENU & MAIN
+# ════════════════════════════════════════════════════════════════
+
+def interactive_menu(use_slm: bool):
+    print("\n" + "=" * 74)
+    print("  WAYMO CAPTION CHECKER v2")
+    print("  Pass 1: Grammar (25 cat, 600+ rules)")
+    print("  Pass 2: Low Confidence (20 cat, 150+ patterns)")
+    print("  Pass 3: SLM Coedit (grammarly/coedit-large)")
+    print("=" * 74)
+    print("\n  1. PDF file (.pdf)")
+    print("  2. Text file (.txt)")
+    print("  3. Type text manually")
+    print("  0. Exit\n")
+
+    choice  = input("  Choice (0-3): ").strip()
+    checker = WaymoCapChecker(use_slm=use_slm)
+    handler = FileInputHandler()
+
+    if choice == "0":
+        sys.exit(0)
+    elif choice == "1":
+        fp = input("  PDF path: ").strip().strip('"')
+        text = handler.read_pdf(fp); source = fp
+    elif choice == "2":
+        fp = input("  TXT path: ").strip().strip('"')
+        text = handler.read_txt(fp); source = fp
+    elif choice == "3":
+        text = handler.read_manual(); source = "manual"
+    else:
+        print("Invalid choice."); sys.exit(1)
+
+    print("\n⚙️  Running combined 3-pass analysis...")
+    result = checker.analyze(text, source_file=source)
+    print(checker.report(result))
+
+    if input("\n  Save report? (y/n): ").strip().lower() == "y":
+        out = input("  Filename (Enter=auto): ").strip()
+        checker.save_report(result, out or None)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Waymo Caption Checker v2 — Grammar + Low Confidence + SLM"
+    )
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--pdf",    metavar="FILE.pdf", help="Analyze a PDF file")
+    g.add_argument("--txt",    metavar="FILE.txt", help="Analyze a text file")
+    g.add_argument("--text",   metavar="'text'",   help="Analyze a text string")
+    parser.add_argument("--save",   metavar="out.txt", default=None)
+    parser.add_argument("--no-slm", action="store_true",
+                        help="Skip SLM pass (faster, no transformers needed)")
+    args = parser.parse_args()
+
+    use_slm = not args.no_slm
+
+    if len(sys.argv) == 1:
+        interactive_menu(use_slm)
+        sys.exit(0)
+
+    checker = WaymoCapChecker(use_slm=use_slm)
+    handler = FileInputHandler()
+
+    if args.pdf:
+        text = handler.read_pdf(args.pdf); source = args.pdf
+    elif args.txt:
+        text = handler.read_txt(args.txt); source = args.txt
+    elif args.text:
+        text = args.text; source = "command line"
+    else:
+        interactive_menu(use_slm); sys.exit(0)
+
+    print("\n⚙️  Running combined 3-pass analysis...")
+    result = checker.analyze(text, source_file=source)
+    print(checker.report(result))
+    if args.save:
+        checker.save_report(result, args.save)
